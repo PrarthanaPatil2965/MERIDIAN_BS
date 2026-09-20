@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+node_modules/
+.expo/
+dist/
+backend/models/*.onnx
+*.log
+.DS_Store
