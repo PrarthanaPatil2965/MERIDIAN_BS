@@ -14,14 +14,19 @@ const HOLD_MS = 2000;
 const COUNTDOWN = 3;
 
 /**
- * Two deliberate steps before anything is sent: a two second hold, then a
- * three second spoken countdown that any tap cancels. Accidental pocket
- * presses do not reach a real person.
+ * Two deliberate steps before anything reaches a real person: a two second
+ * hold, then a three second spoken countdown that any tap cancels.
+ *
+ * Nothing here fails silently. Android will not let an ordinary app send an
+ * SMS without the user seeing it, so the composer opens pre-filled; if even
+ * that is unavailable the call still goes through and the reason appears on
+ * screen rather than being swallowed.
  */
 export default function SosButton({ compact = false }) {
   const { settings, uiLang } = useApp();
   const [phase, setPhase] = useState('idle'); // idle | holding | armed | sending
   const [count, setCount] = useState(COUNTDOWN);
+  const [status, setStatus] = useState(null);
   const holdTimer = useRef(null);
   const tickTimer = useRef(null);
 
@@ -34,8 +39,12 @@ export default function SosButton({ compact = false }) {
 
   useEffect(() => clearAll, []);
 
+  const normalise = (n) => (n || '').replace(/[\s()-]/g, '');
+
   const onPressIn = () => {
     if (phase === 'armed') return cancel();
+    if (phase === 'sending') return;
+    setStatus(null);
     setPhase('holding');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
     holdTimer.current = setTimeout(arm, HOLD_MS);
@@ -53,12 +62,17 @@ export default function SosButton({ compact = false }) {
     stopSpeaking();
     setPhase('idle');
     setCount(COUNTDOWN);
-    say(uiLang === 'hi' ? 'रद्द किया गया' : 'Cancelled', { lang: uiLang, rate: settings.speechRate });
+    setStatus(null);
+    say(uiLang === 'hi' ? 'रद्द किया गया' : 'Cancelled', {
+      lang: uiLang,
+      rate: settings.speechRate,
+    });
   };
 
   const arm = () => {
-    if (!settings.emergencyContact) {
+    if (!normalise(settings.emergencyContact)) {
       say(t(uiLang, 'sosNoContact'), { lang: uiLang, urgency: 'urgent', rate: settings.speechRate });
+      setStatus(t(uiLang, 'sosNoContact'));
       Alert.alert(t(uiLang, 'sos'), t(uiLang, 'sosNoContact'));
       setPhase('idle');
       return;
@@ -67,7 +81,11 @@ export default function SosButton({ compact = false }) {
     setPhase('armed');
     let n = COUNTDOWN;
     setCount(n);
-    say(`${t(uiLang, 'sosArmed')} ${n}`, { lang: uiLang, urgency: 'urgent', rate: settings.speechRate });
+    say(`${t(uiLang, 'sosArmed')} ${n}`, {
+      lang: uiLang,
+      urgency: 'urgent',
+      rate: settings.speechRate,
+    });
     tickTimer.current = setInterval(() => {
       n -= 1;
       setCount(n);
@@ -80,29 +98,46 @@ export default function SosButton({ compact = false }) {
     }, 1000);
   };
 
+  const placeCall = (number) => {
+    // telprompt is iOS-only; tel: is the portable form and works in Expo Go
+    // on Android. Neither works on an emulator without a dialler.
+    const url = `tel:${number}`;
+    Linking.openURL(url).catch((e) =>
+      setStatus(`Could not open the dialler: ${e.message}. Call ${number} manually.`)
+    );
+  };
+
   const fire = async () => {
     setPhase('sending');
+    const number = normalise(settings.emergencyContact);
     say(t(uiLang, 'sosSending'), { lang: uiLang, urgency: 'urgent', rate: settings.speechRate });
+    setStatus(uiLang === 'hi' ? 'लोकेशन ली जा रही है…' : 'Getting your location…');
 
     let lat = null;
     let lng = null;
     try {
-      const perm = await Location.getForegroundPermissionsAsync();
-      if (perm.granted || (await Location.requestForegroundPermissionsAsync()).granted) {
-        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      let perm = await Location.getForegroundPermissionsAsync();
+      if (!perm.granted) perm = await Location.requestForegroundPermissionsAsync();
+      if (perm.granted) {
+        const pos = await Promise.race([
+          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000)),
+        ]);
         lat = pos.coords.latitude;
         lng = pos.coords.longitude;
       }
-    } catch {}
+    } catch {
+      // An emergency must not wait on a GPS fix. Send without it.
+    }
 
     let message =
       uiLang === 'hi'
-        ? `आपातकाल। मुझे तुरंत मदद चाहिए। BlindSpot द्वारा भेजा गया।`
-        : `EMERGENCY. I need help now. Sent by BlindSpot.`;
+        ? 'आपातकाल। मुझे तुरंत मदद चाहिए। BlindSpot द्वारा भेजा गया।'
+        : 'EMERGENCY. I need help now. Sent by BlindSpot.';
     try {
       const res = await buildSos({
         name: settings.userName,
-        contact: settings.emergencyContact,
+        contact: number,
         lat,
         lng,
         lang: uiLang,
@@ -112,19 +147,32 @@ export default function SosButton({ compact = false }) {
       if (lat && lng) message += ` https://maps.google.com/?q=${lat},${lng}`;
     }
 
+    let smsOk = false;
     try {
       const available = await SMS.isAvailableAsync();
       if (available) {
-        await SMS.sendSMSAsync([settings.emergencyContact], message);
+        setStatus(uiLang === 'hi' ? 'संदेश खुल रहा है…' : 'Opening the message…');
+        const result = await SMS.sendSMSAsync([number], message);
+        smsOk = result?.result === 'sent' || result?.result === 'unknown';
+      } else {
+        setStatus(
+          'SMS is unavailable on this device (no SIM, or an emulator). Calling instead.'
+        );
       }
-    } catch {}
+    } catch (e) {
+      setStatus(`Message step failed: ${e.message}. Calling instead.`);
+    }
 
     say(t(uiLang, 'sosCalling'), { lang: uiLang, urgency: 'urgent', rate: settings.speechRate });
-    const tel = Platform.OS === 'android' ? `tel:${settings.emergencyContact}` : `telprompt:${settings.emergencyContact}`;
-    Linking.openURL(tel).catch(() => Linking.openURL(`tel:${settings.emergencyContact}`).catch(() => {}));
 
-    setPhase('idle');
-    setCount(COUNTDOWN);
+    // Give the SMS composer time to close before handing over to the dialler;
+    // firing both in the same tick makes Android drop the second intent.
+    setTimeout(() => {
+      placeCall(number);
+      if (smsOk) setStatus(t(uiLang, 'sosDone'));
+      setPhase('idle');
+      setCount(COUNTDOWN);
+    }, 700);
   };
 
   const label =
@@ -135,25 +183,38 @@ export default function SosButton({ compact = false }) {
       : t(uiLang, 'sos');
 
   return (
-    <Pressable
-      onPressIn={onPressIn}
-      onPressOut={onPressOut}
-      onPress={phase === 'armed' ? cancel : undefined}
-      accessibilityRole="button"
-      accessibilityLabel={t(uiLang, 'sos')}
-      accessibilityHint={t(uiLang, 'sosHold')}
-      style={({ pressed }) => [
-        s.wrap,
-        compact && s.compact,
-        { backgroundColor: phase === 'idle' ? colors.urgent : '#B51D22', opacity: pressed ? 0.85 : 1 },
-      ]}
-    >
-      <Text style={[compact ? type.bodyStrong : type.title, { color: '#fff' }]}>{label}</Text>
-      {phase === 'idle' && !compact && (
-        <Text style={[type.caption, { color: '#FFD7D8', marginTop: 2 }]}>{t(uiLang, 'sosHold')}</Text>
-      )}
-      {phase === 'holding' && <View style={s.holdBar} />}
-    </Pressable>
+    <View>
+      <Pressable
+        onPressIn={onPressIn}
+        onPressOut={onPressOut}
+        onPress={phase === 'armed' ? cancel : undefined}
+        accessibilityRole="button"
+        accessibilityLabel={t(uiLang, 'sos')}
+        accessibilityHint={t(uiLang, 'sosHold')}
+        style={({ pressed }) => [
+          s.wrap,
+          compact && s.compact,
+          {
+            backgroundColor: phase === 'idle' ? colors.urgent : '#B51D22',
+            opacity: pressed ? 0.85 : 1,
+          },
+        ]}
+      >
+        <Text style={[compact ? type.bodyStrong : type.title, { color: '#fff' }]}>{label}</Text>
+        {phase === 'idle' && !compact && (
+          <Text style={[type.caption, { color: '#FFD7D8', marginTop: 2 }]}>
+            {t(uiLang, 'sosHold')}
+          </Text>
+        )}
+        {phase === 'holding' && <View style={s.holdBar} />}
+      </Pressable>
+
+      {status ? (
+        <Text style={s.status} accessibilityLiveRegion="assertive">
+          {status}
+        </Text>
+      ) : null}
+    </View>
   );
 }
 
@@ -176,4 +237,5 @@ const s = StyleSheet.create({
     backgroundColor: '#fff',
     opacity: 0.6,
   },
+  status: { color: colors.notice, fontSize: 13, marginTop: 6, textAlign: 'center' },
 });

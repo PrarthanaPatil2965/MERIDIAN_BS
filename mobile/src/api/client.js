@@ -52,8 +52,12 @@ export const ask = (question, imageBase64, lang, sessionId) =>
   });
 
 export async function transcribe(uri, lang = 'auto') {
+  // Whisper picks the decoder from the extension, so keep whatever the
+  // recorder actually produced (m4a on Android, caf or m4a on iOS).
+  const ext = (uri.split('.').pop() || 'm4a').split('?')[0].toLowerCase();
+  const mime = { m4a: 'audio/m4a', mp4: 'audio/mp4', caf: 'audio/x-caf', wav: 'audio/wav' }[ext] || 'audio/m4a';
   const form = new FormData();
-  form.append('file', { uri, name: 'clip.m4a', type: 'audio/m4a' });
+  form.append('file', { uri, name: `clip.${ext}`, type: mime });
   form.append('lang', lang);
   return request('/v1/stt', { body: form, isForm: true, timeout: 25000 });
 }
